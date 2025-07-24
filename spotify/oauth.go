@@ -1,173 +1,193 @@
 package spotify
 
 import (
-	"bytes"
-	"encoding/base64"
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"strings"
-	"time"
+	"os/exec"
+	"runtime"
 )
 
-const (
-	API_URL = "https://api.spotify.com/v1"
-	ACC_URL = "https://accounts.spotify.com"
-)
-
-type Client struct {
-	id    string
-	basic string
-	token string
-	oauth *OAuth
+type OAuth struct {
+	me      string
+	token   string
+	refresh string
 }
 
-type Results struct {
-	Data `json:"tracks"`
-}
-
-type Data struct {
-	URL   string `json:"href"`
-	Songs []Song `json:"items"`
-}
-
-type Song struct {
-	URI     string `json:"uri"`
-	Artists []struct {
-		Name string `json:"name"`
-	} `json:"artists"`
-	Name       string `json:"name"`
-	Popularity int    `json:"popularity"`
-}
-
-func New(id, secret string) (*Client, error) {
-	c := &Client{
-		id:    id,
-		basic: "Basic " + base64.StdEncoding.EncodeToString([]byte(id+":"+secret)),
-	}
-
-	token, err := c.getToken()
+func (c *Client) Authenticate() (err error) {
+	c.oauth, err = c.getOAuth()
 	if err != nil {
-		return nil, Error{"New", "(*Client).getToken", err}
+		return Error{"(*Client).Authenticate", "(*Client).getOAuth", err}
 	}
 
-	c.token = token
-
-	return c, nil
-}
-
-func (c *Client) SearchTrack(query, artist string, retry bool) (Song, error) {
-	encoded := url.QueryEscape(sanitizeQuery(query) + ": " + strings.ReplaceAll(artist, "& ", ","))
-
-	req, err := http.NewRequest("GET", API_URL+"/search?q="+encoded+"&type=track&limit=3", nil)
+	c.oauth.me, err = c.getUserID()
 	if err != nil {
-		return Song{}, Error{"(*Client).SearchTrack", "http.NewRequest", err}
-	}
-
-recurse:
-	req.Header.Set("Authorization", c.token)
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return Song{}, Error{"(*Client).SearchTrack", "(*http.Client).Do", err}
-	}
-
-	if res.StatusCode == 401 || res.StatusCode == 429 {
-		if token, _ := c.getToken(); token != "" {
-			c.token = token
-		}
-		goto recurse
-	}
-
-	defer res.Body.Close()
-
-	var results Results
-	if err = json.NewDecoder(res.Body).Decode(&results); err != nil {
-		return Song{}, Error{"(*Client).SearchTrack", "(*json.Decoder).Decode", err}
-	}
-
-	if len(results.Songs) == 0 {
-		if !retry {
-			return Song{}, Error{"(*Client).SearchTrack", "(*http.Client).Do", errors.New(res.Status + " " + "could not find track \"" + sanitizeQuery(query) + ": " + artist + "\"")}
-		}
-		return c.SearchTrack(query, artist, false)
-	}
-
-	last := Song{Popularity: 0}
-	for _, song := range results.Songs {
-		if strings.EqualFold(sanitizeString(song.Name), sanitizeString(query)) {
-			if song.Popularity > last.Popularity {
-				last = song
-			}
-		}
-	}
-
-	if last.Name != "" {
-		return last, nil
-	}
-
-	return results.Songs[0], nil
-}
-
-func (c *Client) CreatePlaylist(name string) (string, error) {
-	req, err := http.NewRequest("POST", API_URL+"/users/"+c.oauth.me+"/playlists", bytes.NewBuffer([]byte("{\"name\": \""+name+"\", \"description\": \"Converted from Apple Music by Spotivert.\"}")))
-	if err != nil {
-		return "", Error{"(*Client).CreatePlaylist", "http.NewRequest", err}
-	}
-
-	req.Header.Set("Authorization", c.oauth.token)
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", Error{"(*Client).CreatePlaylist", "(*http.Client).Do", err}
-	}
-
-	if res.StatusCode == 429 {
-		return c.CreatePlaylist(name)
-	}
-
-	defer res.Body.Close()
-
-	body, _ := io.ReadAll(res.Body)
-
-	var data map[string]any
-	if err = json.Unmarshal(body, &data); err != nil {
-		fmt.Println(string(body))
-		return "", Error{"(*Client).CreatePlaylist", "(*json.Decoder).Decode", err}
-	}
-
-	if _, ok := data["id"]; !ok {
-		return "", Error{"(*Client).CreatePlaylist", "(*json.Decoder).Decode", errors.New(res.Status + " \"id\" field does not exist in map of type map[string]any")}
-	}
-
-	return data["id"].(string), nil
-}
-
-func (c *Client) AddItems(playlist string, items []string) error {
-	data, err := json.Marshal(map[string][]string{"uris": items})
-	if err != nil {
-		return Error{"(*Client).AddItems", "json.Marshal", err}
-	}
-
-	req, err := http.NewRequest("POST", API_URL+"/playlists/"+playlist+"/tracks", bytes.NewBuffer(data))
-	if err != nil {
-		return Error{"(*Client).AddItems", "http.NewRequest", err}
-	}
-
-	req.Header.Set("Authorization", c.oauth.token)
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return Error{"(*Client).AddItems", "(*http.Client).Do", err}
-	}
-
-	if res.StatusCode != 201 {
-		time.Sleep(2 * time.Second)
-		return c.AddItems(playlist, items)
+		return Error{"(*Client).Authenticate", "(*Client).getUserID", err}
 	}
 
 	return nil
+}
+
+func (c *Client) getToken() (string, error) {
+	req, err := http.NewRequest("POST", ACC_URL+"/api/token?grant_type=client_credentials", nil)
+	if err != nil {
+		return "", Error{"(*Client).getToken", "http.NewRequest", err}
+	}
+
+	req.Header.Set("Authorization", c.basic)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", Error{"(*Client).getToken", "(*http.Client).Do", err}
+	}
+
+	defer res.Body.Close()
+
+	var data map[string]any
+	if err = json.NewDecoder(res.Body).Decode(&data); err != nil {
+		return "", Error{"(*Client).getToken", "(*json.Decoder).Decode", err}
+	}
+
+	if _, ok := data["access_token"]; !ok {
+		return "", Error{"(*Client).getToken", "(*json.Decoder).Decode", errors.New(res.Status + " \"access_token\" field does not exist in map of type map[string]any")}
+	}
+
+	return "Bearer " + data["access_token"].(string), nil
+}
+
+func (c *Client) getOAuth() (*OAuth, error) {
+	values := url.Values{
+		"client_id":     {c.id},
+		"response_type": {"code"},
+		"redirect_uri":  {"http://localhost:8888/callback"},
+		"scope":         {"playlist-modify-public playlist-modify-private"},
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "linux":
+		cmd = exec.Command("xdg-open", ACC_URL+"/authorize?"+values.Encode())
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", ACC_URL+"/authorize?"+values.Encode())
+	case "darwin":
+		cmd = exec.Command("open", ACC_URL+"/authorize?"+values.Encode())
+	default:
+		return &OAuth{}, Error{"(*Client).getOAuth", "exec.Command", errors.New(runtime.GOOS + " is not a supported platform")}
+	}
+
+	if err := cmd.Start(); err != nil {
+		return &OAuth{}, Error{"(*Client).getOAuth", "exec.Command", err}
+	}
+
+	var queries url.Values
+
+	srv := &http.Server{Addr: ":8888"}
+	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		queries = r.URL.Query()
+		http.ServeFile(w, r, "index.html")
+		srv.Shutdown(context.Background())
+	})
+
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		return &OAuth{}, Error{"(*Client).getOAuth", "(*http.Server).ListenAndServe", err}
+	}
+
+	if queries.Get("error") != "" {
+		return &OAuth{}, Error{"(*Client).getOAuth", "(*http.Server).ListenAndServe", errors.New(queries.Get("error") + ": there was an issue with the authentication flow")}
+	}
+
+	values = url.Values{
+		"grant_type":   {"authorization_code"},
+		"code":         {queries.Get("code")},
+		"redirect_uri": {"http://localhost:8888/callback"},
+	}
+
+	req, err := http.NewRequest("POST", ACC_URL+"/api/token?"+values.Encode(), nil)
+	if err != nil {
+		return &OAuth{}, Error{"(*Client).getOAuth", "http.NewRequest", err}
+	}
+
+	req.Header.Set("Authorization", c.basic)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return &OAuth{}, Error{"(*Client).getOAuth", "(*http.Client).Do", err}
+	}
+
+	defer res.Body.Close()
+
+	var data map[string]any
+	if err = json.NewDecoder(res.Body).Decode(&data); err != nil {
+		return &OAuth{}, Error{"(*Client).getOAuth", "(*json.Decoder).Decode", err}
+	}
+
+	if _, ok := data["access_token"]; !ok {
+		return &OAuth{}, Error{"(*Client).getOAuth", "(*json.Decoder).Decode", errors.New(res.Status + " \"access_token\" field does not exist in map of type map[string]any")}
+	}
+
+	return &OAuth{token: "Bearer " + data["access_token"].(string), refresh: data["refresh_token"].(string)}, nil
+}
+
+// func (c *Client) refreshOAuth() (string, error) {
+// 	values := url.Values{
+// 		"grant_type":    {"refresh_token"},
+// 		"refresh_token": {c.oauth.refresh},
+// 	}
+
+// 	req, err := http.NewRequest("POST", ACC_URL+"/api/token?"+values.Encode(), nil)
+// 	if err != nil {
+// 		return "", Error{"(*Client).refreshOAuth", "http.NewRequest", err}
+// 	}
+
+// 	req.Header.Set("Authorization", c.basic)
+// 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+// 	res, err := http.DefaultClient.Do(req)
+// 	if err != nil {
+// 		return "", Error{"(*Client).refreshOAuth", "(*http.Client).Do", err}
+// 	}
+
+// 	defer res.Body.Close()
+
+// 	var data map[string]any
+// 	if err = json.NewDecoder(res.Body).Decode(&data); err != nil {
+// 		return "", Error{"(*Client).refreshOAuth", "(*json.Decoder).Decode", err}
+// 	}
+
+// 	if _, ok := data["access_token"]; !ok {
+// 		return "", Error{"(*Client).refreshOAuth", "(*json.Decoder).Decode", errors.New(res.Status + " \"access_token\" field does not exist in map of type map[string]any")}
+// 	}
+
+// 	return "Bearer " + data["access_token"].(string), nil
+// }
+
+func (c *Client) getUserID() (string, error) {
+	req, err := http.NewRequest("GET", API_URL+"/me", nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", c.oauth.token)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+
+	defer res.Body.Close()
+
+	var data map[string]any
+	if err = json.NewDecoder(res.Body).Decode(&data); err != nil {
+		return "", Error{"(*Client).getUserID", "(*json.Decoder).Decode", err}
+	}
+
+	if _, ok := data["id"]; !ok {
+		return "", Error{"(*Client).getUserID", "(*json.Decoder).Decode", errors.New(res.Status + " \"id\" field does not exist in map of type map[string]any")}
+	}
+
+	return data["id"].(string), nil
 }
