@@ -4,18 +4,15 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
-	"net/http"
-	"net/url"
 	"os"
-	"regexp"
-	"spotivert/apple"
-	"spotivert/spotify"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
+	"spotivert.com/spotivert/apple"
+	"spotivert.com/spotivert/spotify"
+
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/schollz/progressbar/v3"
@@ -25,8 +22,6 @@ var (
 	wg     sync.WaitGroup
 	config Config
 	logger zerolog.Logger
-
-	appleRegex = regexp.MustCompile(`https?://(?:itunes|music)\.apple\.com/.+?(album|playlist).*\/([\w\.\-]+)`)
 )
 
 type Config struct {
@@ -80,17 +75,6 @@ func main() {
 		}
 	}()
 
-	wg.Add(1)
-	var appleClient *apple.Client
-	go func() {
-		defer wg.Done()
-		token, err := getAppleToken()
-		if err != nil {
-			logger.Fatal().Msg(err.Error())
-		}
-		appleClient = apple.New(token)
-	}()
-
 	log.Logger.Info().Msg("What is the URL for the Apple Music playlist you are trying to convert?\n")
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -98,33 +82,33 @@ func main() {
 	scanner.Scan()
 	playlistURL := strings.TrimSpace(scanner.Text())
 
+	wg.Add(1)
+	var playlist apple.Playlist
+	go func() {
+		defer wg.Done()
+		if playlist, err = apple.GetTracks(playlistURL); err != nil {
+			logger.Fatal().Msg(err.Error())
+		}
+	}()
+
 	log.Logger.Info().Msg("What would you like to name the Spotify playlist after converted?\n")
 
 	scanner.Scan()
 	playlistName := strings.TrimSpace(scanner.Text())
 
-	matches := appleRegex.FindAllStringSubmatch(playlistURL, -1)
-	typ, id := matches[0][1], matches[0][2]
-
 	wg.Wait()
 
-	appleSongs, err := appleClient.GetTracks(typ, id)
-	if err != nil {
-		logger.Fatal().Msg(err.Error())
-	}
+	converted := make([]string, len(playlist.Songs))
 
-	converted := make([]string, len(appleSongs))
+	bar := progressbar.Default(int64(len(playlist.Songs)))
 
-	wg.Wait()
-
-	bar := progressbar.Default(int64(len(appleSongs)))
-	for i, s := range appleSongs {
+	for i, s := range playlist.Songs {
 		wg.Add(1)
 		go func(index int, song apple.Song) {
 			defer wg.Done()
 			defer bar.Add(1)
 
-			res, err := spotifyClient.SearchTrack(song.Name, song.Artist, true)
+			res, err := spotifyClient.SearchTrack(song.Title, song.Artist, true)
 			if err != nil {
 				logger.Warn().Msg(err.Error())
 				return
@@ -135,7 +119,6 @@ func main() {
 	}
 
 	wg.Wait()
-
 	bar.Clear()
 
 	var empty int
@@ -153,7 +136,7 @@ func main() {
 
 	log.Logger.Info().Msg("Now adding songs to user's Spotify playlist.")
 
-	id, err = spotifyClient.CreatePlaylist(playlistName)
+	id, err := spotifyClient.CreatePlaylist(playlistName)
 	if err != nil {
 		log.Logger.Fatal().Msg(err.Error())
 	}
@@ -166,30 +149,4 @@ func main() {
 	}
 
 	log.Logger.Info().Msg("Songs added to playlist. Enjoy :)")
-}
-
-func getAppleToken() (string, error) {
-	res, err := http.Get("https://music.apple.com")
-	if err != nil {
-		return "", err
-	}
-
-	doc, err := goquery.NewDocumentFromReader(res.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var query string
-	if str, exists := doc.Find("meta[name='desktop-music-app/config/environment']").Attr("content"); exists {
-		if query, err = url.QueryUnescape(str); err != nil {
-			return "", err
-		}
-	}
-
-	var data map[string]any
-	if err := json.Unmarshal([]byte(query), &data); err != nil {
-		return "", err
-	}
-
-	return "Bearer " + data["MEDIA_API"].(map[string]any)["token"].(string), nil
 }
