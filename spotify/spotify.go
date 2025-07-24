@@ -113,7 +113,7 @@ recurse:
 }
 
 func (c *Client) CreatePlaylist(name string) (string, error) {
-	req, err := http.NewRequest("POST", API_URL+"/users/"+c.oauth.me+"/playlists", bytes.NewBuffer([]byte("{\"name\": \""+name+"\"}")))
+	req, err := http.NewRequest("POST", API_URL+"/users/"+c.oauth.me+"/playlists", bytes.NewBuffer([]byte("{\"name\": \""+name+"\", \"description\": \"Converted from Apple Music by Spotivert.\"}")))
 	if err != nil {
 		return "", Error{"(*Client).CreatePlaylist", "http.NewRequest", err}
 	}
@@ -130,11 +130,6 @@ func (c *Client) CreatePlaylist(name string) (string, error) {
 	}
 
 	defer res.Body.Close()
-
-	// var data map[string]any
-	// if err = json.NewDecoder(res.Body).Decode(&data); err != nil {
-	// 	return "", Error{"(*Client).CreatePlaylist", "(*json.Decoder).Decode", err}
-	// }
 
 	body, _ := io.ReadAll(res.Body)
 
