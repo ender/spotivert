@@ -11,7 +11,7 @@ var (
 	extrRegex = regexp.MustCompile(`[(\[].*?[)\]] ?`)
 )
 
-// Remove certain elements from search queries that I personally found to be potentially problematic in finding the exact match for a song.
+// Remove problematic elements from search queries.
 func sanitizeQuery(str string) string {
 	return strings.TrimSpace(starRegex.ReplaceAllStringFunc(featRegex.ReplaceAllString(str, ""), func(s string) string {
 		return strings.Repeat("*", len(s))
