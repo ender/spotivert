@@ -1,79 +1,99 @@
 package apple
 
 import (
-	"encoding/json"
-	"errors"
-	"net/http"
-	"net/url"
+	"context"
+	"time"
+
+	"github.com/chromedp/chromedp"
+	"github.com/chromedp/chromedp/kb"
 )
 
-const API_URL = "https://api.music.apple.com"
-
-type Client struct {
-	token string
+type results []struct {
+	Song   string `json:"song"`
+	Artist string `json:"artist"`
+	Album  string `json:"album"`
 }
 
 type Playlist struct {
-	Next  string `json:"next"`
-	Songs []Song `json:"data"`
-
-	Errors []struct {
-		Message string `json:"detail"`
-	} `json:"errors"`
+	Songs []Song
 }
 
 type Song struct {
-	Attributes `json:"attributes"`
+	Title  string
+	Artist string
+	Album  string
 }
 
-type Attributes struct {
-	Name   string `json:"name"`
-	Artist string `json:"artistName"`
-}
+func GetTracks(url string) (Playlist, error) {
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
 
-func New(token string) *Client {
-	return &Client{
-		token: token,
+	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var results results
+
+	// JavaScript that scrapes the song details
+	script := `
+		[...document.querySelectorAll('.songs-list-row__song-name-wrapper')].map(wrapper => {
+			const songEl = wrapper.querySelector('.songs-list-row__song-name');
+			const artistEl = wrapper.querySelector('.songs-list-row__by-line a');
+			const row = wrapper.closest('.songs-list-row'); 
+			let albumEl = null;
+			if(row) {
+				albumEl = row.querySelector('.songs-list__col--tertiary a');
+			}
+
+			return {
+				song: songEl ? songEl.textContent.trim() : "",
+				artist: artistEl ? artistEl.textContent.trim() : "",
+				album: albumEl ? albumEl.textContent.trim() : ""
+			};
+		})
+	`
+
+	tasks := chromedp.Tasks{
+		chromedp.Navigate(url),
+		chromedp.WaitVisible(`.songs-list-row__song-name-wrapper`, chromedp.ByQuery),
 	}
-}
 
-func (c *Client) GetTracks(typ, id string) (songs []Song, err error) {
-	req, err := http.NewRequest("GET", API_URL+"/v1/catalog/us/"+typ+"s/"+id+"/tracks?limit=300", nil)
+	err := chromedp.Run(ctx, tasks)
 	if err != nil {
-		return []Song{}, Error{"(*Client).GetTracks", "http.NewRequest", err}
+		return Playlist{}, Error{"GetTracks", "chromedp.Run", err}
 	}
 
-	req.Header.Set("Authorization", c.token)
-	req.Header.Set("referer", "https://music.apple.com")
-	req.Header.Set("origin", "https://music.apple.com")
-
-recurse:
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return []Song{}, Error{"(*Client).GetTracks", "(*http.Client).Do", err}
-	}
-
-	defer res.Body.Close()
-
-	var playlist Playlist
-	err = json.NewDecoder(res.Body).Decode(&playlist)
-	if err != nil {
-		return []Song{}, Error{"(*Client).GetTracks", "(*json.Decoder).Decode", err}
-	}
-
-	if res.StatusCode != 200 {
-		return []Song{}, Error{"(*Client).GetTracks", "(http.Response).StatusCode", errors.New(res.Status + " " + playlist.Errors[0].Message)}
-	}
-
-	songs = append(songs, playlist.Songs...)
-
-	if playlist.Next != "" {
-		req.URL, err = url.Parse(API_URL + playlist.Next + "&limit=300")
-		if err != nil {
-			return []Song{}, Error{"(*Client).GetTracks", "url.Parse", err}
+	// Loop to scroll and wait for the page to fully load
+	for {
+		var isFooterVisible bool
+		if err = chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`document.querySelector('[data-testid="tracklist-footer-description"]') !== null;`, &isFooterVisible)); err != nil {
+			return Playlist{}, Error{"GetTracks", "chromedp.Run", err}
 		}
-		goto recurse
+
+		if isFooterVisible {
+			break
+		}
+
+		if err = chromedp.Run(ctx, chromedp.KeyEvent(kb.End)); err != nil {
+			return Playlist{}, Error{"GetTracks", "chromedp.KeyEvent", err}
+		}
+
+		time.Sleep(200 * time.Millisecond)
 	}
 
-	return songs, nil
+	err = chromedp.Run(ctx, chromedp.Evaluate(script, &results))
+	if err != nil {
+		return Playlist{}, Error{"GetTracks", "chromedp.Evaluate", err}
+	}
+
+	playlist := Playlist{Songs: []Song{}}
+	for _, item := range results {
+		song := Song{
+			item.Song,
+			item.Artist,
+			item.Album,
+		}
+		playlist.Songs = append(playlist.Songs, song)
+	}
+
+	return playlist, nil
 }
